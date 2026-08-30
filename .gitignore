@@ -1,0 +1,17 @@
+# Artefatos de compilacao do Arduino IDE / arduino-cli
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# PlatformIO
+.pio/
+
+# Editores
+.vscode/
+.idea/
+
+# Sistema
+Thumbs.db
+desktop.ini
