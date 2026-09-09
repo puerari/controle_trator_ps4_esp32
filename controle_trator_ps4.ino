@@ -1,5 +1,7 @@
 #include <Bluepad32.h>
 #include <ESP32Servo.h>
+#include <esp_system.h>
+#include <Preferences.h>
 
 Servo meuServo;
 Servo meuMotor;
@@ -15,21 +17,87 @@ const int center = (ml + mr) / 2;
 float xAxis = 0;
 float yAxis = 0;
 bool sirene = false;
+bool optionsAnterior = false;  // borda de subida do Options, ver calibraLimiteBraco()
+bool shareAnterior = false;    // borda de subida do Share, ver reiniciaLimites()
 
-const int step = 10;
+// Limites do braco gravados na flash interna (NVS), para sobreviverem ao desligamento.
+// Isso existe porque a calibragem e feita com o ESP na bateria/power bank, longe do PC:
+// nao da para ler o monitor serial na hora. Grava-se ali, e o valor e lido no proximo
+// boot ligado no computador.
+Preferences prefs;
+const char* NVS_ESPACO = "trator";
+
+// Espaco SEPARADO de proposito: reiniciaLimites() chama prefs.clear() no espaco "trator",
+// e o historico de resets nao pode ser apagado junto com a calibragem. Nao junte os dois.
+const char* NVS_DIAG = "diag";
+const int MAX_HIST_RESET = 20;  // quantos boots o historico guarda
+
+// Largura de pulso do MG996R (braco e concha), em microssegundos.
+const int MG996R_MIN_US = 500;
+const int MG996R_MAX_US = 2500;
+
+// Suavidade do braco e da concha: enquanto o botao esta apertado eles andam 'step' grau
+// por tick do loop, e o tick e um quadro do servo (50 Hz = 20 ms). Um destino novo por
+// quadro e o maximo de suavidade que um servo analogico aceita, e nao existe tempo morto
+// entre um movimento e o seguinte.
+// Velocidade = step * 1000 / tickLoop graus/s, hoje 50 graus/s. Para acelerar, aumente
+// 'step'; para desacelerar, aumente 'tickLoop' (mas isso tambem deixa direcao e tracao
+// menos responsivas, porque o tick e o ritmo de todo o controle).
+const int step = 1;
+const int tickLoop = 20;  // ms, um quadro do servo a 50 Hz
+
+// Posicao de repouso, e ponto de referencia de que todos os limites do braco dependem.
+//
+// Vale 175, nao 90: com o braco TOTALMENTE ABAIXADO em repouso, o servo nao sustenta peso
+// nenhum parado, e o write() do setup() manda ele para onde a gravidade ja deixou o braco
+// -- sem tranco e sem pico de corrente no boot. Com 90 o repouso ficava a 8 graus do topo
+// e o servo segurava o braco no alto o tempo todo.
+//
+// 175 e nao 180 para sobrar folga do batente interno do servo; encostado no extremo o
+// MG996R fica forcando contra o proprio limite.
+//
+// AO MONTAR: ligue o ESP primeiro, deixe o servo assentar em posInicial, e so entao
+// encaixe o braco na posicao mais baixa, sem forcar. E assim que repouso e fundo coincidem.
+const int posInicial = 175;
+
+// ATENCAO: minL/maxL ainda sao os limites dos servos antigos. Com os MG996R e a faixa de
+// pulso acima o mesmo angulo corresponde a uma posicao fisica diferente; precisam ser
+// reconferidos no trator antes de usar o curso completo.
 const int minL = 70;
 const int maxL = 180;
-const int minR = 80;
-const int maxR = 180;
 
-int L = minL;
-int R = minR;
+// O braco esta montado invertido em relacao a concha: angulo MENOR = braco mais alto.
+// Por isso R1 (sobe) decrementa R e para em minR, enquanto R2 (desce) incrementa e para
+// em maxR. O curso e em GRAUS a partir de posInicial, de proposito independente de 'step'
+// (que hoje vale 1 grau por tick, nao mais um passo de 10). Os dois lados sao
+// independentes, e normal eles divergirem depois da calibragem no trator.
+// cursoSobe foi MEDIDO no trator: braco no alto, Options, valor lido da NVS.
+//
+// cursoDesce = 0 e proposital: o repouso JA e o ponto mais baixo, entao R2 nao tem para
+// onde descer. Ele so serve para trazer o braco de volta ao repouso depois que R1 subiu.
+//
+// cursoSobe = 44 foi MEDIDO com o braco montado: subiu em toques de R1 ate o batente e
+// capturou com Options. Fechar esta janela nao e cosmetico -- com ela aberta em 170 o
+// software deixava o R1 empurrar o servo 87 graus alem do batente, travando o MG996R em
+// stall. Era uma das fontes de brownout.
+const int cursoSobe = 44;   // limite do R1, medido
+const int cursoDesce = 0;   // limite do R2: o repouso e o fundo
+// Nao sao const: Options captura a posicao atual como limite (ver calibraLimiteBraco).
+int minR = posInicial - cursoSobe;   // 175 - 44 = 131
+int maxR = posInicial + cursoDesce;  // 175 + 0 = 175, o proprio repouso
+
+int L = posInicial;
+int R = posInicial;
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
+  // Apaga a barra de luz uma vez, aqui. Isso ficava no inicio do dumpCar(), ou seja a cada
+  // passada do loop; com o tick de 20 ms viraria 50 relatorios Bluetooth por segundo.
+  ctl->setColorLED(0, 0, 0);
+
   bool foundEmptySlot = false;
   for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
     if (myControllers[i] == nullptr) {
@@ -257,8 +325,122 @@ void dumpGamepad(ControllerPtr ctl) {
   );
 }
 
+// O tick e curto, entao logar toda passada inundaria o monitor serial. Loga a cada 10
+// graus, que e a granularidade que o log tinha antes. Limite que nao caia em multiplo de
+// 10 nao aparece no log.
+void logaAngulo(const char* rotulo, int angulo) {
+  if (angulo % 10 == 0)
+    Serial.printf("%s=%d\n", rotulo, angulo);
+}
+
+// Grava os limites do braco na NVS. Sobrescrever o mesmo valor nao gasta flash: o
+// nvs_set_i32 por baixo compara antes e ignora escrita identica.
+void salvaLimites() {
+  if (!prefs.begin(NVS_ESPACO, false)) {
+    Serial.println("Falha ao abrir a NVS para gravar");
+    return;
+  }
+  prefs.putInt("posRef", posInicial);  // referencia de que estes limites dependem
+  prefs.putInt("minR", minR);
+  prefs.putInt("maxR", maxR);
+  prefs.end();
+}
+
+// Le os limites gravados, se houver, e imprime o que ficou valendo. Chamada no boot: e por
+// esta linha que se descobre o que foi capturado longe do computador.
+void carregaLimites() {
+  bool daNvs = false;
+  bool descartado = false;
+  // Aberto para escrita porque pode precisar descartar calibragem velha.
+  if (prefs.begin(NVS_ESPACO, false)) {
+    if (prefs.isKey("minR")) {
+      if (prefs.getInt("posRef", -1) == posInicial) {
+        minR = prefs.getInt("minR", minR);
+        maxR = prefs.getInt("maxR", maxR);
+        daNvs = true;
+      } else {
+        // Os limites gravados foram medidos a partir de OUTRO posInicial, entao nao querem
+        // dizer mais nada. Sem este descarte, mudar posInicial no codigo nao surtia efeito
+        // algum -- a NVS vencia em silencio e so um Share salvava. Ja mordeu duas vezes.
+        prefs.clear();
+        descartado = true;
+      }
+    }
+    prefs.end();
+  }
+  if (descartado)
+    Serial.println("Calibragem da NVS descartada: foi medida a partir de outro posInicial");
+  Serial.printf("Limites do braco (%s): minR=%d cursoSobe=%d | maxR=%d cursoDesce=%d\n",
+                daNvs ? "NVS" : "padrao do codigo",
+                minR, posInicial - minR, maxR, maxR - posInicial);
+}
+
+// Captura a posicao ATUAL do braco como limite do lado em que ele esta, grava na NVS e
+// confirma com vibracao no controle -- a confirmacao e' tatil de proposito, porque durante
+// a calibragem o ESP esta no power bank e nao ha monitor serial para olhar.
+//
+// Nao existe leitura da posicao real do servo: um MG996R e um servo de 3 fios, o
+// potenciometro interno nao sai no conector, e Servo::read() da ESP32Servo apenas ecoa o
+// ultimo valor escrito (readMicroseconds() devolve this->ticks, nunca consulta o servo).
+// Entao 'R' e a melhor referencia disponivel: ele acompanha o servo de perto porque so
+// anda de 1 em 1 grau por tick. Se o braco for movido a mao, travar ou escorregar sob
+// carga, 'R' deixa de valer e so reiniciar ressincroniza.
+//
+// O valor sobrevive ao desligamento. Para tornar definitivo no codigo, edite
+// cursoSobe/cursoDesce com o numero que aparece no boot seguinte.
+void calibraLimiteBraco(ControllerPtr ctl) {
+  if (R == posInicial) {
+    Serial.printf("Braco em posInicial (%d). Mova com R1 ou R2 antes de capturar.\n", posInicial);
+    ctl->playDualRumble(0, 100, 0x40, 0x00);  // fraco e curto: nada capturado
+    return;
+  }
+
+  if (R < posInicial) {
+    minR = R;  // braco acima do meio: limite de SUBIDA
+    Serial.printf("Limite de subida capturado: minR=%d (cursoSobe = %d)\n", minR, posInicial - minR);
+  } else {
+    maxR = R;  // braco abaixo do meio: limite de DESCIDA
+    Serial.printf("Limite de descida capturado: maxR=%d (cursoDesce = %d)\n", maxR, maxR - posInicial);
+  }
+
+  salvaLimites();
+  ctl->playDualRumble(0, 300, 0x40, 0xC0);  // forte e longo: gravado na NVS
+}
+
+// Desfaz a calibragem: volta aos valores do codigo e limpa a NVS.
+//
+// Isto NAO e opcional. Um limite capturado curto demais se auto-tranca: o braco nao
+// consegue passar dele, entao nao ha como leva-lo ate o limite real para recapturar um
+// valor maior. Sem esta saida, uma captura ruim so se desfaz regravando o firmware.
+void reiniciaLimites(ControllerPtr ctl) {
+  minR = posInicial - cursoSobe;
+  maxR = posInicial + cursoDesce;
+  if (prefs.begin(NVS_ESPACO, false)) {
+    prefs.clear();  // so o espaco "trator"; o historico de resets vive em NVS_DIAG
+    prefs.end();
+  }
+  Serial.printf("Limites restaurados do codigo: minR=%d cursoSobe=%d | maxR=%d cursoDesce=%d\n",
+                minR, cursoSobe, maxR, cursoDesce);
+  // dois pulsos curtos, para nao confundir com a captura (que e um pulso longo).
+  // O delayedStartMs agenda o segundo sem bloquear o loop.
+  ctl->playDualRumble(0, 120, 0x00, 0x60);
+  ctl->playDualRumble(260, 120, 0x00, 0x60);
+}
+
 void dumpCar(ControllerPtr ctl) {
-  ctl->setColorLED(0, 0, 0);
+  // Options captura o limite do braco. Borda de subida, senao repetiria a cada tick
+  // enquanto o botao estiver apertado.
+  bool options = ctl->miscButtons() & MISC_BUTTON_START;
+  if (options && !optionsAnterior)
+    calibraLimiteBraco(ctl);
+  optionsAnterior = options;
+
+  // Share desfaz a calibragem e volta aos limites do codigo.
+  bool share = ctl->miscButtons() & MISC_BUTTON_SELECT;
+  if (share && !shareAnterior)
+    reiniciaLimites(ctl);
+  shareAnterior = share;
+
   if (ctl->buttons() == 1) { // X
     meuMotor.write(0);  //para trás
   } else if(ctl->buttons() == 8) { //Triangle
@@ -268,27 +450,27 @@ void dumpCar(ControllerPtr ctl) {
   }
 
   if (ctl->buttons() == 16) { // L1
-    if(L < maxL)
+    if (L < maxL)
       L += step;
     meuConch.write(L); //sobe
-    Serial.println("L1");
+    logaAngulo("L1 concha", L);
   } else if(ctl->buttons() == 64) { // L2
     if (L > minL)
       L -= step;
     meuConch.write(L); //desce
-    Serial.println("L2");
+    logaAngulo("L2 concha", L);
   }
 
   if (ctl->buttons() == 32) { // R1
-    if (R < maxR)
-      R += step;
-    meuBraco.write(R); //sobe
-    Serial.println("R1");
-  } else if(ctl->buttons() == 128) { // R2
     if (R > minR)
       R -= step;
+    meuBraco.write(R); //sobe
+    logaAngulo("R1 braco", R);
+  } else if(ctl->buttons() == 128) { // R2
+    if (R < maxR)
+      R += step;
     meuBraco.write(R); // desce
-    Serial.println("R2");
+    logaAngulo("R2 braco", R);
   }
 
   /*switch (ctl->buttons()) {
@@ -385,9 +567,83 @@ void processControllers() {
   }
 }
 
+// Diagnostico: imprime por que o ESP reiniciou. BROWNOUT/POWERON apontam para queda
+// de tensao (servo puxando corrente demais); PANIC/WDT apontam para falha de software.
+void mostrarMotivoReset() {
+  esp_reset_reason_t motivo = esp_reset_reason();
+  const char* nome;
+  switch (motivo) {
+    case ESP_RST_POWERON:   nome = "POWERON (energia ligada ou queda total de tensao)"; break;
+    case ESP_RST_BROWNOUT:  nome = "BROWNOUT (tensao caiu abaixo do limite)"; break;
+    case ESP_RST_PANIC:     nome = "PANIC (excecao de software)"; break;
+    case ESP_RST_TASK_WDT:  nome = "TASK_WDT (watchdog de tarefa)"; break;
+    case ESP_RST_INT_WDT:   nome = "INT_WDT (watchdog de interrupcao)"; break;
+    case ESP_RST_WDT:       nome = "WDT (outro watchdog)"; break;
+    case ESP_RST_SW:        nome = "SW (reset por software)"; break;
+    case ESP_RST_EXT:       nome = "EXT (pino de reset / botao EN)"; break;
+    case ESP_RST_DEEPSLEEP: nome = "DEEPSLEEP"; break;
+    case ESP_RST_SDIO:      nome = "SDIO"; break;
+    default:                nome = "UNKNOWN"; break;
+  }
+  Serial.printf("Motivo do reset: %d - %s\n", (int)motivo, nome);
+  Serial.printf("Heap livre: %u bytes\n", (unsigned)ESP.getFreeHeap());
+}
+
+// Um caractere por motivo, para o historico caber em pouca coisa e ser legivel de relance.
+char codigoReset(esp_reset_reason_t motivo) {
+  switch (motivo) {
+    case ESP_RST_POWERON:   return 'P';
+    case ESP_RST_BROWNOUT:  return 'B';
+    case ESP_RST_PANIC:     return 'X';
+    case ESP_RST_TASK_WDT:  return 'W';
+    case ESP_RST_INT_WDT:   return 'W';
+    case ESP_RST_WDT:       return 'W';
+    case ESP_RST_SW:        return 'S';
+    case ESP_RST_EXT:       return 'E';
+    case ESP_RST_DEEPSLEEP: return 'D';
+    default:                return '?';
+  }
+}
+
+// Grava na NVS quantos boots o ESP ja teve e o motivo dos ultimos MAX_HIST_RESET.
+//
+// Por que HISTORICO e nao "ultimo motivo": abrir a porta serial reseta a placa (ver
+// CLAUDE.md). Um slot unico seria sobrescrito por esse proprio reset, exatamente na hora de
+// ler -- foi assim que se perdeu a evidencia de um reset ocorrido em campo.
+//
+// Por que TAMBEM um contador de boots: uma queda de tensao severa apaga o dominio RTC e se
+// apresenta como POWERON, indistinguivel de ligar na tomada. O que denuncia o problema nao
+// e o motivo, e a contagem -- se voce ligou uma vez e surgiram cinco boots, houve quatro
+// resets que ninguem pediu.
+//
+// Chamada no inicio do setup(), de proposito ANTES do posicionamento dos servos: se a
+// escrita no servo derrubar a placa, este boot ja esta registrado.
+void registraReset() {
+  if (!prefs.begin(NVS_DIAG, false)) {
+    Serial.println("Falha ao abrir a NVS de diagnostico");
+    return;
+  }
+  int boots = prefs.getInt("boots", 0) + 1;
+  prefs.putInt("boots", boots);
+
+  String hist = prefs.getString("hist", "");
+  hist += codigoReset(esp_reset_reason());
+  while (hist.length() > MAX_HIST_RESET)
+    hist = hist.substring(1);  // descarta o mais antigo
+  prefs.putString("hist", hist);
+  prefs.end();
+
+  Serial.printf("Boot #%d | resets antigo->recente: %s\n", boots, hist.c_str());
+  Serial.println("  P=poweron B=brownout X=panic W=watchdog S=software E=pino D=deepsleep ?=outro");
+}
+
 // Arduino setup function. Runs in CPU 1
 void setup() {
   Serial.begin(115200);
+  delay(300);  // da tempo do monitor serial abrir antes do diagnostico
+  mostrarMotivoReset();
+  registraReset();
+  carregaLimites();
   Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
   const uint8_t* addr = BP32.localBdAddress();
   Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
@@ -399,6 +655,23 @@ void setup() {
   // But it might also fix some connection / re-connection issues.
   //BP32.forgetBluetoothKeys();
 
+  meuServo.attach(pinoServo);
+  meuMotor.attach(pinoMotor);
+  // Braco e concha sao MG996R. O attach(pin) da ESP32Servo usa 544-2400us, que nao
+  // cobre o curso completo do MG996R; 500-2500us da os 180 graus.
+  meuBraco.attach(pinoBraco, MG996R_MIN_US, MG996R_MAX_US);
+  meuConch.attach(pinoConch, MG996R_MIN_US, MG996R_MAX_US);
+
+  // Posicao inicial. Depois do attach o servo ainda nao recebe pulso, entao a posicao
+  // fisica dele e desconhecida e o primeiro R1/L1 daria um salto de tamanho imprevisivel.
+  // Mandar posInicial aqui sincroniza R e L com o servo, e a partir dai todo movimento e
+  // um passo de 'step' em rampa. Um servo por vez, para nao somar os picos de corrente.
+  // Feito antes de BP32.setup() para nao coincidir com o radio Bluetooth subindo.
+  meuBraco.write(R);
+  delay(500);
+  meuConch.write(L);
+  delay(500);
+
   // Setup the Bluepad32 callbacks
   BP32.setup(&onConnectedController, &onDisconnectedController);
 
@@ -409,10 +682,6 @@ void setup() {
   // By default, it is disabled.
   BP32.enableVirtualDevice(false);
 
-  meuServo.attach(pinoServo);
-  meuMotor.attach(pinoMotor);
-  meuBraco.attach(pinoBraco);
-  meuConch.attach(pinoConch);
   //pinMode(buzzerPin, OUTPUT);
 }
 
@@ -432,5 +701,5 @@ void loop() {
   // https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
 
   //     vTaskDelay(1);
-  delay(150);
+  delay(tickLoop);
 }
