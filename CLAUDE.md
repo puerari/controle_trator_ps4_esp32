@@ -125,6 +125,19 @@ this project — only gamepads are ever connected.
 | `pinoBraco`  | 19  | Arm servo (`meuBraco`)                |
 | `pinoConch`  | 21  | Bucket servo (`meuConch`)             |
 | `pinoServo`  | 26  | Steering servo (`meuServo`)           |
+| `pinoLed`    | 2   | Onboard blue LED — on while a controller is connected |
+
+`pinoLed` is hardcoded to 2 because the core's generic `esp32` variant does not define
+`LED_BUILTIN`. That is the pin on most ESP32 DevKit boards, but some use 5 or 16 — if the LED
+never lights, that constant is what to change. GPIO 2 is a strapping pin and must be low or
+floating at boot, which the board's own LED circuit already ensures; driving it as an output
+afterwards is fine.
+
+`atualizaLedConexao()` derives the LED from the `myControllers` array rather than from
+`isConnected()`, and is called from both connect and disconnect callbacks. The array is the
+sketch's source of truth — the controller is stored on connect and set back to `nullptr` on
+disconnect — so the LED does not depend on what `isConnected()` reports at the instant a
+callback runs.
 
 Ranges, all in servo degrees:
 

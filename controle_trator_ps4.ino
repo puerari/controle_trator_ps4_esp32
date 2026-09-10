@@ -11,6 +11,12 @@ const int pinoMotor = 18; //18
 const int pinoBraco = 19; //19
 const int pinoConch = 21; //21
 const int pinoServo = 26; //26
+// LED azul embutido na placa. A variante 'esp32' generica do core nao define LED_BUILTIN,
+// entao o pino vai fixo aqui: 2 e o usado na grande maioria dos DevKit ESP32, mas ha placas
+// com 5 ou 16 -- se o LED nao responder, e este numero que muda.
+// GPIO 2 e strapping pin: precisa estar baixo ou solto no boot, o que o proprio LED da placa
+// garante. Usar como saida depois do boot nao interfere.
+const int pinoLed = 2;
 const int ml = 32;
 const int mr = 93;
 const int center = (ml + mr) / 2;
@@ -121,6 +127,21 @@ int R = posBraco;
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
+// Acende o LED azul da placa enquanto houver algum controle conectado, apaga quando o
+// ultimo sair. Usa o proprio array myControllers como fonte da verdade: ele recebe o
+// controle no connect e volta a nullptr no disconnect, entao nao depende do estado interno
+// de isConnected() no instante em que o callback roda.
+void atualizaLedConexao() {
+  bool algumConectado = false;
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] != nullptr) {
+      algumConectado = true;
+      break;
+    }
+  }
+  digitalWrite(pinoLed, algumConectado ? HIGH : LOW);
+}
+
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
@@ -145,6 +166,8 @@ void onConnectedController(ControllerPtr ctl) {
   if (!foundEmptySlot) {
     Serial.println("CALLBACK: Controller connected, but could not found empty slot");
   }
+
+  atualizaLedConexao();
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
@@ -162,6 +185,8 @@ void onDisconnectedController(ControllerPtr ctl) {
   if (!foundController) {
     Serial.println("CALLBACK: Controller disconnected, but not found in myControllers");
   }
+
+  atualizaLedConexao();
 }
 
 void dumpMouse(ControllerPtr ctl) {
@@ -726,6 +751,9 @@ void setup() {
   // Forgetting Bluetooth keys prevents "paired" gamepads to reconnect.
   // But it might also fix some connection / re-connection issues.
   //BP32.forgetBluetoothKeys();
+
+  pinMode(pinoLed, OUTPUT);
+  digitalWrite(pinoLed, LOW);  // apagado ate um controle conectar
 
   meuServo.attach(pinoServo);
   meuMotor.attach(pinoMotor);
