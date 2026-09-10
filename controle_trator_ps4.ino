@@ -17,7 +17,7 @@ const int center = (ml + mr) / 2;
 float xAxis = 0;
 float yAxis = 0;
 bool sirene = false;
-bool optionsAnterior = false;  // borda de subida do Options, ver calibraLimiteBraco()
+bool optionsAnterior = false;  // borda de subida do Options, ver calibraLimites()
 bool shareAnterior = false;    // borda de subida do Share, ver reiniciaLimites()
 
 // Limites do braco gravados na flash interna (NVS), para sobreviverem ao desligamento.
@@ -56,38 +56,68 @@ const int tickLoop = 20;  // ms, um quadro do servo a 50 Hz
 // 175 e nao 180 para sobrar folga do batente interno do servo; encostado no extremo o
 // MG996R fica forcando contra o proprio limite.
 //
-// AO MONTAR: ligue o ESP primeiro, deixe o servo assentar em posInicial, e so entao
-// encaixe o braco na posicao mais baixa, sem forcar. E assim que repouso e fundo coincidem.
-const int posInicial = 175;
+// AO MONTAR: ligue o ESP primeiro, deixe o servo assentar em posBraco, e so entao encaixe
+// o braco na posicao mais baixa, sem forcar. E assim que repouso e fundo coincidem.
+const int posBraco = 175;
 
-// ATENCAO: minL/maxL ainda sao os limites dos servos antigos. Com os MG996R e a faixa de
-// pulso acima o mesmo angulo corresponde a uma posicao fisica diferente; precisam ser
-// reconferidos no trator antes de usar o curso completo.
-const int minL = 70;
-const int maxL = 180;
-
-// O braco esta montado invertido em relacao a concha: angulo MENOR = braco mais alto.
-// Por isso R1 (sobe) decrementa R e para em minR, enquanto R2 (desce) incrementa e para
-// em maxR. O curso e em GRAUS a partir de posInicial, de proposito independente de 'step'
-// (que hoje vale 1 grau por tick, nao mais um passo de 10). Os dois lados sao
-// independentes, e normal eles divergirem depois da calibragem no trator.
-// cursoSobe foi MEDIDO no trator: braco no alto, Options, valor lido da NVS.
+// O braco esta montado invertido: angulo MENOR = braco mais alto. Por isso R1 (sobe)
+// decrementa R e para em minR, enquanto R2 (desce) incrementa e para em maxR.
 //
-// cursoDesce = 0 e proposital: o repouso JA e o ponto mais baixo, entao R2 nao tem para
-// onde descer. Ele so serve para trazer o braco de volta ao repouso depois que R1 subiu.
+// O curso e em GRAUS a partir do repouso, de proposito independente de 'step' (que vale
+// 1 grau por tick, nao um passo de 10).
 //
 // cursoSobe = 44 foi MEDIDO com o braco montado: subiu em toques de R1 ate o batente e
 // capturou com Options. Fechar esta janela nao e cosmetico -- com ela aberta em 170 o
 // software deixava o R1 empurrar o servo 87 graus alem do batente, travando o MG996R em
 // stall. Era uma das fontes de brownout.
+//
+// cursoDesce = 0 e proposital: o repouso JA e o ponto mais baixo, entao R2 nao tem para
+// onde descer. Ele so serve para trazer o braco de volta ao repouso depois que R1 subiu.
 const int cursoSobe = 44;   // limite do R1, medido
 const int cursoDesce = 0;   // limite do R2: o repouso e o fundo
-// Nao sao const: Options captura a posicao atual como limite (ver calibraLimiteBraco).
-int minR = posInicial - cursoSobe;   // 175 - 44 = 131
-int maxR = posInicial + cursoDesce;  // 175 + 0 = 175, o proprio repouso
 
-int L = posInicial;
-int R = posInicial;
+// Repouso da CONCHA, no MEIO do curso -- diferente do braco, que descansa no fundo. Por
+// isso ela tem folga para os dois lados e tem DOIS limites a medir.
+//
+// A concha e invertida, igual ao braco: angulo MENOR = concha mais alta. L1 (sobe)
+// decrementa L e para em minL, L2 (desce) incrementa e para em maxL. Os dois atuadores
+// seguem a mesma convencao: minX e o limite de subida, maxX o de descida.
+//
+// Os dois cursos foram MEDIDOS com a concha montada: 25 graus para cima (concha em 65) e
+// 23 para baixo (em 113), 48 no total, bem centrados no repouso. Para medir, cada janela foi
+// aberta em 85 e fechada depois -- nao se mede um limite que esta fora do limite vigente, e
+// com 85 aberto o L1/L2 podia empurrar o servo uns 60 graus alem do batente, travando o
+// MG996R em stall.
+//
+// A inversao de L1/L2 nao mexeu nos angulos, so em qual botao chega a cada um. O que estava
+// registrado como limite do L1 (113) era na verdade o fundo.
+//
+// O limite superior foi medido duas vezes: 70 na primeira, 65 na segunda. Se 65 estiver um
+// pouco alem do batente real, o servo fica em leve stall parado no alto. Se aparecer B no
+// historico de resets com a concha parada em cima, e este o suspeito.
+//
+// PARA REMEDIR: abrir a constante NAO basta. A NVS guarda o angulo medido e, se posConcha
+// nao mudar, o posRefC continua batendo e a NVS vence no boot. Aperte SHARE antes de medir.
+// Restaurar dos valores do codigo devolve os mesmos limites do braco, entao ele nao se perde.
+//
+// AO MONTAR: ligue o ESP primeiro, deixe o servo assentar em posConcha, e so entao encaixe
+// a concha no meio do curso dela, sem forcar.
+//
+// ATENCAO: repouso no meio significa que, parada, a concha e sustentada pelo servo contra a
+// gravidade -- consumo continuo, ao contrario do braco. Numa alimentacao no limite isso
+// conta. Em troca, o tranco maximo no boot cai pela metade, porque o repouso fica no centro.
+const int posConcha = 90;
+const int cursoSobeConcha = 25;   // limite do L1, medido (concha em 65)
+const int cursoDesceConcha = 23;  // limite do L2, medido (concha em 113)
+
+// Nao sao const: Options captura a posicao atual como limite (ver calibraLimites).
+int minR = posBraco - cursoSobe;   // 175 - 44 = 131
+int maxR = posBraco + cursoDesce;  // 175 + 0 = 175, o proprio repouso
+int minL = posConcha - cursoSobeConcha;   // 90 - 25 = 65, limite de SUBIDA
+int maxL = posConcha + cursoDesceConcha;  // 90 + 23 = 113, limite de DESCIDA
+
+int L = posConcha;
+int R = posBraco;
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
@@ -340,67 +370,107 @@ void salvaLimites() {
     Serial.println("Falha ao abrir a NVS para gravar");
     return;
   }
-  prefs.putInt("posRef", posInicial);  // referencia de que estes limites dependem
+  // Cada par guarda o repouso de que depende, para poder ser invalidado sozinho.
+  prefs.putInt("posRefR", posBraco);
   prefs.putInt("minR", minR);
   prefs.putInt("maxR", maxR);
+  prefs.putInt("posRefC", posConcha);
+  prefs.putInt("minL", minL);
+  prefs.putInt("maxL", maxL);
   prefs.end();
 }
 
 // Le os limites gravados, se houver, e imprime o que ficou valendo. Chamada no boot: e por
 // esta linha que se descobre o que foi capturado longe do computador.
 void carregaLimites() {
-  bool daNvs = false;
-  bool descartado = false;
+  bool bracoNvs = false, conchaNvs = false, descartado = false;
   // Aberto para escrita porque pode precisar descartar calibragem velha.
   if (prefs.begin(NVS_ESPACO, false)) {
+    // Cada par e validado contra o repouso de que foi medido; limites tirados a partir de
+    // outro repouso nao querem dizer mais nada. Sem este descarte, mudar posBraco ou
+    // posConcha no codigo nao surtia efeito algum -- a NVS vencia em silencio e so um Share
+    // salvava. Ja mordeu duas vezes. Os pares sao removidos separadamente, para invalidar a
+    // calibragem do braco nao levar a da concha junto.
     if (prefs.isKey("minR")) {
-      if (prefs.getInt("posRef", -1) == posInicial) {
+      if (prefs.getInt("posRefR", -1) == posBraco) {
         minR = prefs.getInt("minR", minR);
         maxR = prefs.getInt("maxR", maxR);
-        daNvs = true;
+        bracoNvs = true;
       } else {
-        // Os limites gravados foram medidos a partir de OUTRO posInicial, entao nao querem
-        // dizer mais nada. Sem este descarte, mudar posInicial no codigo nao surtia efeito
-        // algum -- a NVS vencia em silencio e so um Share salvava. Ja mordeu duas vezes.
-        prefs.clear();
+        prefs.remove("minR");
+        prefs.remove("maxR");
+        prefs.remove("posRefR");
+        descartado = true;
+      }
+    }
+    if (prefs.isKey("minL")) {
+      if (prefs.getInt("posRefC", -1) == posConcha) {
+        minL = prefs.getInt("minL", minL);
+        maxL = prefs.getInt("maxL", maxL);
+        conchaNvs = true;
+      } else {
+        prefs.remove("minL");
+        prefs.remove("maxL");
+        prefs.remove("posRefC");
         descartado = true;
       }
     }
     prefs.end();
   }
   if (descartado)
-    Serial.println("Calibragem da NVS descartada: foi medida a partir de outro posInicial");
-  Serial.printf("Limites do braco (%s): minR=%d cursoSobe=%d | maxR=%d cursoDesce=%d\n",
-                daNvs ? "NVS" : "padrao do codigo",
-                minR, posInicial - minR, maxR, maxR - posInicial);
+    Serial.println("Calibragem descartada: foi medida a partir de outro ponto de repouso");
+  Serial.printf("Braco  (%s): repouso=%d | sobe ate %d (cursoSobe=%d) | desce ate %d (cursoDesce=%d)\n",
+                bracoNvs ? "NVS" : "codigo", posBraco,
+                minR, posBraco - minR, maxR, maxR - posBraco);
+  Serial.printf("Concha (%s): repouso=%d | sobe ate %d (cursoSobeConcha=%d) | desce ate %d (cursoDesceConcha=%d)\n",
+                conchaNvs ? "NVS" : "codigo", posConcha,
+                minL, posConcha - minL, maxL, maxL - posConcha);
 }
 
-// Captura a posicao ATUAL do braco como limite do lado em que ele esta, grava na NVS e
-// confirma com vibracao no controle -- a confirmacao e' tatil de proposito, porque durante
-// a calibragem o ESP esta no power bank e nao ha monitor serial para olhar.
+// Captura a posicao ATUAL do braco E da concha como limite do lado a que cada um esta
+// deslocado, grava na NVS e confirma com vibracao no controle -- a confirmacao e tatil de
+// proposito, porque durante a calibragem o ESP esta no power bank e nao ha monitor serial.
+//
+// Quem estiver no proprio repouso e ignorado, entao na pratica so e capturado o que voce
+// acabou de mover. Mover os dois e apertar Options captura os dois, o que tambem esta certo.
 //
 // Nao existe leitura da posicao real do servo: um MG996R e um servo de 3 fios, o
 // potenciometro interno nao sai no conector, e Servo::read() da ESP32Servo apenas ecoa o
 // ultimo valor escrito (readMicroseconds() devolve this->ticks, nunca consulta o servo).
-// Entao 'R' e a melhor referencia disponivel: ele acompanha o servo de perto porque so
-// anda de 1 em 1 grau por tick. Se o braco for movido a mao, travar ou escorregar sob
-// carga, 'R' deixa de valer e so reiniciar ressincroniza.
+// Entao R e L sao a melhor referencia disponivel: acompanham o servo de perto porque so
+// andam de 1 em 1 grau por tick. Se algo for movido a mao, travar ou escorregar sob carga, a
+// variavel deixa de valer e so reiniciar ressincroniza.
 //
-// O valor sobrevive ao desligamento. Para tornar definitivo no codigo, edite
-// cursoSobe/cursoDesce com o numero que aparece no boot seguinte.
-void calibraLimiteBraco(ControllerPtr ctl) {
-  if (R == posInicial) {
-    Serial.printf("Braco em posInicial (%d). Mova com R1 ou R2 antes de capturar.\n", posInicial);
-    ctl->playDualRumble(0, 100, 0x40, 0x00);  // fraco e curto: nada capturado
-    return;
+// O valor sobrevive ao desligamento. Para tornar definitivo no codigo, edite as constantes
+// de curso com os numeros que aparecem no boot seguinte.
+void calibraLimites(ControllerPtr ctl) {
+  bool capturou = false;
+
+  if (R < posBraco) {  // braco acima do repouso: limite de SUBIDA
+    minR = R;
+    Serial.printf("Braco, subida: minR=%d (cursoSobe = %d)\n", minR, posBraco - minR);
+    capturou = true;
+  } else if (R > posBraco) {  // abaixo do repouso: limite de DESCIDA
+    maxR = R;
+    Serial.printf("Braco, descida: maxR=%d (cursoDesce = %d)\n", maxR, maxR - posBraco);
+    capturou = true;
   }
 
-  if (R < posInicial) {
-    minR = R;  // braco acima do meio: limite de SUBIDA
-    Serial.printf("Limite de subida capturado: minR=%d (cursoSobe = %d)\n", minR, posInicial - minR);
-  } else {
-    maxR = R;  // braco abaixo do meio: limite de DESCIDA
-    Serial.printf("Limite de descida capturado: maxR=%d (cursoDesce = %d)\n", maxR, maxR - posInicial);
+  // A concha e invertida, igual ao braco: angulo menor = concha mais alta.
+  if (L < posConcha) {
+    minL = L;
+    Serial.printf("Concha, subida: minL=%d (cursoSobeConcha = %d)\n", minL, posConcha - minL);
+    capturou = true;
+  } else if (L > posConcha) {
+    maxL = L;
+    Serial.printf("Concha, descida: maxL=%d (cursoDesceConcha = %d)\n", maxL, maxL - posConcha);
+    capturou = true;
+  }
+
+  if (!capturou) {
+    Serial.println("Braco e concha nos pontos de repouso. Mova um deles antes de capturar.");
+    ctl->playDualRumble(0, 100, 0x40, 0x00);  // fraco e curto: nada capturado
+    return;
   }
 
   salvaLimites();
@@ -413,14 +483,16 @@ void calibraLimiteBraco(ControllerPtr ctl) {
 // consegue passar dele, entao nao ha como leva-lo ate o limite real para recapturar um
 // valor maior. Sem esta saida, uma captura ruim so se desfaz regravando o firmware.
 void reiniciaLimites(ControllerPtr ctl) {
-  minR = posInicial - cursoSobe;
-  maxR = posInicial + cursoDesce;
+  minR = posBraco - cursoSobe;
+  maxR = posBraco + cursoDesce;
+  minL = posConcha - cursoSobeConcha;
+  maxL = posConcha + cursoDesceConcha;
   if (prefs.begin(NVS_ESPACO, false)) {
     prefs.clear();  // so o espaco "trator"; o historico de resets vive em NVS_DIAG
     prefs.end();
   }
-  Serial.printf("Limites restaurados do codigo: minR=%d cursoSobe=%d | maxR=%d cursoDesce=%d\n",
-                minR, cursoSobe, maxR, cursoDesce);
+  Serial.printf("Limites restaurados do codigo: braco %d..%d | concha %d..%d\n",
+                minR, maxR, minL, maxL);
   // dois pulsos curtos, para nao confundir com a captura (que e um pulso longo).
   // O delayedStartMs agenda o segundo sem bloquear o loop.
   ctl->playDualRumble(0, 120, 0x00, 0x60);
@@ -428,11 +500,11 @@ void reiniciaLimites(ControllerPtr ctl) {
 }
 
 void dumpCar(ControllerPtr ctl) {
-  // Options captura o limite do braco. Borda de subida, senao repetiria a cada tick
-  // enquanto o botao estiver apertado.
+  // Options captura os limites do braco e da concha. Borda de subida, senao repetiria a
+  // cada tick enquanto o botao estiver apertado.
   bool options = ctl->miscButtons() & MISC_BUTTON_START;
   if (options && !optionsAnterior)
-    calibraLimiteBraco(ctl);
+    calibraLimites(ctl);
   optionsAnterior = options;
 
   // Share desfaz a calibragem e volta aos limites do codigo.
@@ -450,13 +522,13 @@ void dumpCar(ControllerPtr ctl) {
   }
 
   if (ctl->buttons() == 16) { // L1
-    if (L < maxL)
-      L += step;
+    if (L > minL)
+      L -= step;
     meuConch.write(L); //sobe
     logaAngulo("L1 concha", L);
   } else if(ctl->buttons() == 64) { // L2
-    if (L > minL)
-      L -= step;
+    if (L < maxL)
+      L += step;
     meuConch.write(L); //desce
     logaAngulo("L2 concha", L);
   }
@@ -664,7 +736,7 @@ void setup() {
 
   // Posicao inicial. Depois do attach o servo ainda nao recebe pulso, entao a posicao
   // fisica dele e desconhecida e o primeiro R1/L1 daria um salto de tamanho imprevisivel.
-  // Mandar posInicial aqui sincroniza R e L com o servo, e a partir dai todo movimento e
+  // Mandar o repouso aqui sincroniza R e L com os servos, e dai em diante todo movimento e
   // um passo de 'step' em rampa. Um servo por vez, para nao somar os picos de corrente.
   // Feito antes de BP32.setup() para nao coincidir com o radio Bluetooth subindo.
   meuBraco.write(R);

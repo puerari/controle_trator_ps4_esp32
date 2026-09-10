@@ -76,17 +76,22 @@ while ($sw.Elapsed.TotalSeconds -lt 8) { $p.ReadExisting(); Start-Sleep -Millise
 $p.Close(); $p.Dispose()
 ```
 
-Two things learned the hard way:
+The sketch only prints during `setup()`, so a read is useless unless the board reboots while
+the port is open. Getting that right took three tries:
 
-- **Opening the port resets the board**, which is convenient — the sketch only prints during
-  `setup()`, so this is how you catch the boot banner and the NVS limits readout. The reset
-  reads back as `POWERON`, not `EXT`; on the ESP32 an EN-pin reset is indistinguishable from
-  power-on.
-- **Do not toggle `RtsEnable` after `Open()`** to force a reset. It re-enumerates the USB
-  device, which throws "the port is closed" on every subsequent read and produces a stream
-  of *repeated, partially truncated* boot banners. That looks exactly like a boot loop and is
-  purely a measurement artifact. A passive listen with the lines left alone is the way to
-  tell a real reboot loop from this.
+- **Opening the port sometimes resets the board and sometimes does not** — it did on a plain
+  open, but not right after an `--upload`, which leaves the control lines in a different
+  state. Do not rely on it.
+- **Do not toggle `RtsEnable` after `Open()`.** It re-enumerates the USB device, throws "the
+  port is closed" on subsequent reads, and yields a stream of *repeated, partially truncated*
+  banners that looks exactly like a boot loop but is pure artifact.
+- **What works:** set `RtsEnable = $true` and `DtrEnable = $false` *before* `Open()` so the
+  chip is held in reset as the port opens, then clear `RtsEnable` once it is open. The board
+  boots with the port already listening — one clean banner, no errors. DTR must stay false or
+  the chip enters the download bootloader instead of the sketch.
+
+The reset reads back as `POWERON`, not `EXT`; on the ESP32 an EN-pin reset is
+indistinguishable from power-on.
 
 A healthy build reports roughly `729821 bytes (55%)` of program storage and `87636 bytes
 (26%)` of dynamic memory. A large jump in either is worth a look.
@@ -126,24 +131,38 @@ Ranges, all in servo degrees:
 - Drive motor is a continuous-rotation/ESC signal: `0` = reverse, `90` = stop, `180` = forward.
 - Steering is limited to `ml`(32) .. `mr`(93) — these are mechanical end stops for this
   chassis. Do not widen them without checking the linkage.
-- Bucket `L` moves within `minL`(70)..`maxL`(180); arm `R` within `minR`(131)..`maxR`(175).
-  Both start at `posInicial`(175) and are written there in `setup()`.
-- **`posInicial`(175) is the arm's fully-lowered rest position**, and `maxR` equals it, so
+- **The arm and the bucket have separate rest positions**, `posBraco`(175) and
+  `posConcha`(90). Both are written in `setup()`; `R` starts at `posBraco`, `L` at
+  `posConcha`. They used to share one `posInicial`, which left the bucket resting near the
+  top of its range.
+- Arm `R` moves within `minR`(131)..`maxR`(175); bucket `L` within `minL`(65)..`maxL`(113).
+- **`posBraco`(175) is the arm's fully-lowered rest position**, and `maxR` equals it, so
   `cursoDesce` is 0 — R2 cannot go below rest, it only brings the arm back down after R1
   raised it. All of the travel is upward. This is deliberate: at rest the servo carries no
   load, and the `write()` in `setup()` commands the position gravity already left the arm in,
   so booting costs no swing and no current spike. It used to be 90, which sat 8 deg from the
   *top* — the servo held the arm up permanently, on a supply that is already marginal.
   175 rather than 180 keeps clear of the servo's internal end stop.
-- When mounting: power the ESP first, let the servo settle at `posInicial`, and only then fit
-  the arm at its lowest position without forcing it. That is what makes rest and bottom
-  coincide.
+- **`posConcha`(90) is mid-travel**, so the bucket has slack both ways and therefore *two*
+  limits to measure, unlike the arm. The trade-off is the mirror image of the arm's: mid-rest
+  means the servo holds the bucket against gravity while idle — continuous current on a
+  supply that is already marginal — but the worst-case swing at boot is halved, since rest
+  sits in the centre rather than at an end.
+- **Both actuators are inverted**: a *smaller* angle means *higher*, for the arm and for the
+  bucket alike. So the convention is uniform — `minR`/`minL` are the **up** limits, reached by
+  R1/L1 decrementing, and `maxR`/`maxL` are the **down** limits, reached by R2/L2
+  incrementing. The bucket was initially wired the other way round and L1/L2 were swapped
+  once the direction was confirmed on the machine.
+- When mounting either one: power the ESP first, let the servo settle at its rest angle, and
+  only then fit the linkage — the arm at its lowest position, the bucket at mid-travel —
+  without forcing it. That is what makes the rest angle and the physical rest coincide.
 - **The arm servo is mounted inverted**; the bucket is not. A *smaller* angle means a
   *higher* arm, so R1 (up) decrements `R` and stops at `minR`, while R2 (down) increments
   and stops at `maxR`. Getting this backwards drives the arm the wrong way, so check it
   before touching that block.
-- Both arm limits are derived from `posInicial`, in **degrees** per side:
-  `minR = posInicial - cursoSobe` and `maxR = posInicial + cursoDesce`. Retune
+- All four limits are derived from a rest position, in **degrees** per side:
+  `minR = posBraco - cursoSobe`, `maxR = posBraco + cursoDesce`,
+  `minL = posConcha - cursoSobeConcha`, `maxL = posConcha + cursoDesceConcha`. Retune
   `cursoSobe`/`cursoDesce`, never `minR`/`maxR` directly. They are deliberately *not*
   expressed in `step`s — `step` is the per-tick increment (1 deg), not a press-sized jump, so
   multiplying by it would collapse the travel to a few degrees.
@@ -152,11 +171,24 @@ Ranges, all in servo degrees:
   because you cannot measure a limit that lies outside the limit in force. Closing it again
   is not cosmetic: while open, R1 could drive the servo 87 degrees past the mechanical stop
   and hold the MG996R in stall, one of the brownout sources.
+- `cursoSobeConcha`(25) and `cursoDesceConcha`(23) are both **measured** with the bucket
+  mounted — 48 degrees of travel, near-symmetric about the rest angle. Each window was opened
+  to 85 to take the measurement and closed again afterwards, which matters: while open, L1/L2
+  could drive the servo some 60 degrees past the mechanical stop and hold the MG996R in
+  stall. Note that swapping L1/L2 did not move the measured *angles*, only which button
+  reaches which — what had been recorded as the L1 limit (113) turned out to be the bottom.
+- The bucket's upper stop was measured twice, giving 70 and then 65. If 65 is slightly past
+  the true stop, the servo sits in mild stall while parked high; suspect that first if `B`
+  entries appear with the bucket resting up.
+- **Re-measuring needs a Share press, not just a wider constant.** NVS stores the measured
+  angle and, as long as the rest position is unchanged, `posRefC` still matches so NVS wins at
+  boot — you would measure the old value again. Verify the boot line says `(codigo)` and the
+  wide limit before measuring. Restoring from the constants gives the arm back its own
+  limits unchanged, so its calibration is not lost.
 - `minR`/`maxR` are **not `const`** — Options overwrites them at runtime, and NVS overrides
   them at boot. See Calibrating the arm limits.
 - Arm and bucket are **MG996R** servos, attached with an explicit 500..2500 us pulse range
-  (`MG996R_MIN_US`/`MG996R_MAX_US`) instead of the library default of 544..2400. `minL` and
-  `maxL` still hold the old servos' values and need reconfirming on the chassis.
+  (`MG996R_MIN_US`/`MG996R_MAX_US`) instead of the library default of 544..2400.
 
 ## Control mapping
 
@@ -169,11 +201,11 @@ a cleanup.
 |--------------|------|----------------------------|
 | X            | 1    | drive backward             |
 | Triangle     | 8    | drive forward              |
-| L1 / L2      | 16 / 64 | bucket up / down (`L`)  |
+| L1 / L2      | 16 / 64 | bucket up / down (`L`) — inverted, see Ranges |
 | R1 / R2      | 32 / 128 | arm up / down (`R`) — inverted, see Ranges |
 | D-pad up/down| 1 / 2 | drive forward / backward  |
 | D-pad left/right | 8 / 4 | steer to `ml` / `mr`  |
-| Options      | misc `MISC_BUTTON_START` | capture the current arm position as that side's limit, save to NVS |
+| Options      | misc `MISC_BUTTON_START` | capture arm *and* bucket positions as limits, save to NVS |
 | Share        | misc `MISC_BUTTON_SELECT` | restore arm limits to the code defaults, clear NVS |
 | Left stick X | —    | proportional steering, only when the D-pad is not steering |
 | Right stick Y| —    | proportional throttle, only when neither the D-pad nor X/Triangle is driving |
@@ -216,7 +248,7 @@ only echoes the last written value — `readMicroseconds()` returns `this->ticks
 potentiometer wiper to an ADC pin, or moving to a serial/smart servo.
 
 What the sketch does instead: `R` is a good *proxy* for the physical position, because it
-only ever moves 1 degree per tick from a known start (`posInicial`, written in `setup()`).
+only ever moves 1 degree per tick from a known start (the rest angle written in `setup()`).
 It stops being valid if the arm is moved by hand, jams, or slips under load — only a reboot
 resynchronises it.
 
@@ -227,11 +259,15 @@ USB cannot supply the servos. So there is no serial monitor at the moment of cap
 constraint drives two design choices — persist to flash, and confirm by touch.
 
 1. On the power bank, drive the arm to a mechanical limit with R1 or R2.
-2. Press **Options**. `calibraLimiteBraco()` captures the current `R` as that side's limit —
-   `minR` if the arm is short of `posInicial` (the up side), `maxR` if past it (the down
-   side) — and `salvaLimites()` writes both to NVS under the `trator` namespace.
+2. Press **Options**. `calibraLimites()` captures whichever actuator is displaced from its
+   rest, on the side it is displaced toward: `minR`/`maxR` for the arm against `posBraco`,
+   `maxL`/`minL` for the bucket against `posConcha`. Anything sitting exactly at its rest is
+   ignored, so in practice only what you just moved gets captured — move both and press
+   Options and both are captured, which is also correct. `salvaLimites()` writes all four to
+   NVS under the `trator` namespace.
 3. The controller **rumbles** to confirm: a strong 300 ms pulse means saved, a weak 100 ms
-   pulse means the arm was still exactly at `posInicial` so there was nothing to capture.
+   pulse means both were still exactly at their rest angles, so there was nothing to
+   capture.
    This is the only feedback available in the field, so do not remove it.
 4. Back on USB, `carregaLimites()` runs at boot, applies the stored values and prints them:
 
@@ -244,11 +280,13 @@ constraint drives two design choices — persist to flash, and confirm by touch.
    source. Until then NVS is what actually governs, and it wins over the constants on every
    boot.
 
-`salvaLimites()` also stores `posRef`, the `posInicial` the measurement was taken from, and
-`carregaLimites()` throws the stored limits away when it no longer matches the compiled
-value — printing `Calibragem da NVS descartada`. Without that check, editing `posInicial`
-had no effect at all: NVS silently won and only a Share press rescued it. That trap cost two
-bogus measurements before the check existed, so keep it.
+`salvaLimites()` also stores `posRefR` and `posRefC`, the rest angles each pair was measured
+from, and `carregaLimites()` throws a pair away when its reference no longer matches the
+compiled value — printing `Calibragem descartada`. Without that check, editing `posBraco` or
+`posConcha` had no effect at all: NVS silently won and only a Share press rescued it. That
+trap cost two bogus measurements before the check existed, so keep it. The two pairs are
+invalidated with targeted `remove()` calls rather than `clear()`, so discarding the arm's
+calibration does not take the bucket's with it.
 
 **A captured limit that is too tight self-locks.** With `minR` stored at 89, the arm cannot
 travel past 89, so it can never be driven to the real limit to capture a wider value —
@@ -267,10 +305,11 @@ Rumble vocabulary, since it is the only field feedback:
 | Pattern | Meaning |
 |---------|---------|
 | one long strong pulse (300 ms) | limit captured and saved to NVS |
-| one short weak pulse (100 ms)  | arm was still at `posInicial`, nothing captured |
+| one short weak pulse (100 ms)  | both were at their rest angles, nothing captured |
 | two short pulses (120 ms each) | limits restored to code defaults, NVS cleared |
 
-The bucket has no equivalent; `minL`/`maxL` are plain absolute angles.
+Both actuators go through the same path — there is no separate bucket flow and no second
+button.
 
 ## Conventions
 
@@ -307,8 +346,9 @@ It lives in a **separate NVS namespace** (`diag`, not `trator`) because `reinici
 calls `prefs.clear()` on `trator` — merging them would let a Share press erase the
 diagnostic history along with the calibration.
 
-**What it has already shown.** On 2026-09-09, boot #16 read `PPPBPPPBBPBPPBBP` — six
-brownouts in sixteen boots. The supply is *not* adequately fixed: powering the board from a
+**What it has already shown.** On 2026-09-09, boot #40 read `PPBBBPPBPPPBPBPPPBPP` — seven
+brownouts in the last twenty boots, with runs of three in a row during the calibration
+sessions, when the travel windows were open and the servo could stall against its stops. The supply is *not* adequately fixed: powering the board from a
 stronger source removed the USB current cap but left the servo current flowing through the
 board's 5V trace and the regulator's input node. Read this history before assuming a
 software cause for any arm or bucket misbehaviour, and expect it to keep happening until a
